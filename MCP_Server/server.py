@@ -139,7 +139,7 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator", "set_clip_property"
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -508,6 +508,112 @@ def get_clip_notes(
     except Exception as e:
         logger.error(f"Error getting clip notes: {str(e)}")
         return f"Error getting clip notes: {str(e)}"
+
+
+# Mirrors CLIP_WRITABLE_PROPERTIES in the Remote Script, which has the final say.
+CLIP_WRITABLE_PROPERTIES = (
+    "start_marker", "end_marker", "warping", "warp_mode",
+    "pitch_coarse", "pitch_fine", "gain",
+)
+
+
+@mcp.tool()
+@telemetry_tool("get_clip_info")
+@trajectory_tool("get_clip_info")
+def get_clip_info(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read a Session-view clip's settings: start/end markers, loop points and,
+    for audio clips, warping, warp mode, transpose, detune, gain and file path.
+
+    Markers and loop points are in beats for MIDI and warped audio clips; for
+    unwarped audio Live reports loop points in seconds.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session clip slot index
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("get_clip_info")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "get_clip_info",
+            {"track_index": track_index, "clip_index": clip_index},
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting clip info: {str(e)}")
+        return f"Error getting clip info: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_clip_property")
+@trajectory_tool("set_clip_property")
+def set_clip_property(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    property: str,
+    value: float | bool,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set one setting on a Session-view clip. Use get_clip_info first to see
+    the current values.
+
+    Writable properties:
+    - start_marker, end_marker: beats (any clip); start must stay before end
+    - warping: true/false (audio clips)
+    - warp_mode: 0 Beats, 1 Tones, 2 Texture, 3 Re-Pitch, 4 Complex,
+      6 Complex Pro; get_clip_info lists the modes this clip allows (audio)
+    - pitch_coarse: transpose in semitones, -48 … 48 (audio)
+    - pitch_fine: detune in cents, -50 … 49 (audio)
+    - gain: 0.0 … 1.0 (audio); get_clip_info shows it in dB
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session clip slot index
+    - property: One of the writable properties above
+    - value: New value
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    if property not in CLIP_WRITABLE_PROPERTIES:
+        return (
+            f"Clip property '{property}' is not writable; "
+            f"allowed: {', '.join(CLIP_WRITABLE_PROPERTIES)}"
+        )
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_clip_property")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "set_clip_property",
+            {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "property": property,
+                "value": value,
+            },
+        )
+        return (
+            f"Set {property} on clip at track {track_index}, slot {clip_index}: "
+            f"{result.get('old_value')} → {result.get('value')}"
+        )
+    except Exception as e:
+        logger.error(f"Error setting clip property: {str(e)}")
+        return f"Error setting clip property: {str(e)}"
 
 
 @mcp.tool()

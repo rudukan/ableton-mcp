@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.7.1-clip1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -57,7 +57,29 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "clear_notes_from_clip",
+    "get_clip_info",
+    "set_clip_property",
 ]
+
+# The only clip properties set_clip_property may write, with the type each
+# value is coerced to. Everything else on the clip stays read-only here.
+CLIP_WRITABLE_PROPERTIES = {
+    "start_marker": float,
+    "end_marker": float,
+    "warping": bool,
+    "warp_mode": int,
+    "pitch_coarse": int,
+    "pitch_fine": float,
+    "gain": float,
+}
+# Live exposes these on audio clips only.
+AUDIO_ONLY_CLIP_PROPERTIES = frozenset(
+    ["warping", "warp_mode", "pitch_coarse", "pitch_fine", "gain"])
+# Clip.warp_mode indices as documented in the Live Object Model.
+WARP_MODE_NAMES = {
+    0: "Beats", 1: "Tones", 2: "Texture", 3: "Re-Pitch",
+    4: "Complex", 5: "REX", 6: "Complex Pro",
+}
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -300,7 +322,7 @@ class AbletonMCP(ControlSurface):
                                  "switch_to_arrangement_view", "set_current_song_time",
                                  "duplicate_session_clip_to_arrangement",
                                  "map_rack_magnitude", "inspect_rack",
-                                 "create_locator"]:
+                                 "create_locator", "set_clip_property"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -400,6 +422,12 @@ class AbletonMCP(ControlSurface):
                             name = params.get("name", "")
                             time_val = params.get("time", 0.0)
                             result = self._create_locator(name, time_val)
+                        elif command_type == "set_clip_property":
+                            result = self._set_clip_property(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("property", ""),
+                                params.get("value"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -456,6 +484,10 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 clip_index = params.get("clip_index", 0)
                 response["result"] = self._get_clip_notes(track_index, clip_index)
+            elif command_type == "get_clip_info":
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_clip_info(track_index, clip_index)
             elif command_type == "get_device_parameters":
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
@@ -2196,6 +2228,109 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting clip notes: " + str(e))
+            raise
+
+    def _session_clip(self, track_index, clip_index):
+        """Return the clip in a Session slot; raise on a bad index or empty slot."""
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if clip_index < 0 or clip_index >= len(track.clip_slots):
+            raise IndexError("Clip index out of range")
+        slot = track.clip_slots[clip_index]
+        if not slot.has_clip:
+            raise Exception("No clip in slot")
+        return slot.clip
+
+    def _get_clip_info(self, track_index, clip_index):
+        """Read the settings set_clip_property can change, plus some context.
+
+        Markers and loop points are in beats for MIDI and warped audio clips.
+        For unwarped audio the LOM gives loop points in seconds.
+        """
+        try:
+            clip = self._session_clip(track_index, clip_index)
+            is_audio = bool(getattr(clip, "is_audio_clip", False))
+            info = {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "name": clip.name,
+                "is_audio_clip": is_audio,
+                "is_midi_clip": bool(getattr(clip, "is_midi_clip", False)),
+                "length": self._safe_attr(clip, "length", float, None),
+                "looping": self._safe_attr(clip, "looping", bool, None),
+                "loop_start": self._safe_attr(clip, "loop_start", float, None),
+                "loop_end": self._safe_attr(clip, "loop_end", float, None),
+                "start_marker": self._safe_attr(clip, "start_marker", float, None),
+                "end_marker": self._safe_attr(clip, "end_marker", float, None),
+            }
+            if is_audio:
+                warp_mode = self._safe_attr(clip, "warp_mode", int, None)
+                info.update({
+                    "warping": self._safe_attr(clip, "warping", bool, None),
+                    "warp_mode": warp_mode,
+                    "warp_mode_name": WARP_MODE_NAMES.get(warp_mode),
+                    "available_warp_modes": self._safe_attr(
+                        clip, "available_warp_modes", list, None),
+                    "pitch_coarse": self._safe_attr(clip, "pitch_coarse", int, None),
+                    # Detune is in cents and may be fractional; keep the float.
+                    "pitch_fine": self._safe_attr(clip, "pitch_fine", float, None),
+                    "gain": self._safe_attr(clip, "gain", float, None),
+                    "gain_display_string": self._safe_attr(
+                        clip, "gain_display_string", str, None),
+                    "file_path": self._safe_attr(clip, "file_path", str, None),
+                })
+            return dict((k, v) for k, v in info.items() if v is not None)
+        except Exception as e:
+            self.log_message("Error getting clip info: " + str(e))
+            raise
+
+    def _coerce_clip_value(self, prop, value):
+        kind = CLIP_WRITABLE_PROPERTIES[prop]
+        if kind is bool:
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text in ("1", "true", "yes", "on"):
+                    return True
+                if text in ("0", "false", "no", "off"):
+                    return False
+                raise ValueError("'%s' takes true or false, got %r" % (prop, value))
+            return bool(value)
+        number = float(value)
+        if kind is int:
+            if number != int(number):
+                raise ValueError("'%s' takes a whole number, got %r" % (prop, value))
+            return int(number)
+        return number
+
+    def _set_clip_property(self, track_index, clip_index, prop, value):
+        """Write one allow-listed clip property and read it back.
+
+        Live defers setting warping, so its read-back here can still show the
+        old value; a get_clip_info a moment later shows the settled state.
+        """
+        try:
+            if prop not in CLIP_WRITABLE_PROPERTIES:
+                raise ValueError(
+                    "Clip property '%s' is not writable; allowed: %s"
+                    % (prop, ", ".join(sorted(CLIP_WRITABLE_PROPERTIES))))
+            clip = self._session_clip(track_index, clip_index)
+            if (prop in AUDIO_ONLY_CLIP_PROPERTIES
+                    and not getattr(clip, "is_audio_clip", False)):
+                raise ValueError("'%s' is available on audio clips only" % prop)
+            new_value = self._coerce_clip_value(prop, value)
+            old_value = getattr(clip, prop)
+            setattr(clip, prop, new_value)
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "clip_name": clip.name,
+                "property": prop,
+                "old_value": old_value,
+                "value": getattr(clip, prop),
+            }
+        except Exception as e:
+            self.log_message("Error setting clip property: " + str(e))
             raise
 
     def _get_device_parameters(self, track_index, device_index):
